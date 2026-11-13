@@ -1,0 +1,207 @@
+name: Fork validation
+
+# Fork-only and manual-only: nothing here starts on a push, a schedule, or a
+# pull_request, so upstream automation is never triggered by this file. A run is
+# always an explicit choice made from the fork's Actions tab.
+#
+# It validates the fork's open PR branches against the current upstream main —
+# contributor attribution, lint, merge compatibility, and the focused regression
+# tests each PR owns — and records the exact commit and base it tested in the job
+# summary. Deliberately NOT part of any upstream PR diff.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base branch each PR branch is validated against and merged into.
+        type: string
+        default: upstream/main
+      run_lint:
+        description: Run the lint lane (installs the pinned ruff).
+        type: boolean
+        default: true
+      run_tests:
+        description: Run the focused regression lane (builds the test environment).
+        type: boolean
+        default: true
+
+# Bounded: one live run per dispatched ref. A re-dispatch replaces the stale run
+# instead of queueing behind it.
+concurrency:
+  group: fork-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.branch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - branch: feat/telegram-todo-checklist
+            pr: 31106
+            scope: gateway — Telegram todo checklist and the progress/flood loop
+            tests: >-
+              tests/plugins/test_telegram_todo_api.py
+              tests/plugins/test_telegram_todo_api_failures.py
+              tests/gateway/test_todo_checklist_delivery.py
+              tests/gateway/test_todo_progress_cancellation.py
+              tests/gateway/test_run_turn_todo_progress.py
+          - branch: fix/context-compressor-inflation
+            pr: 21470
+            scope: agent — compressor pre-guard against summary inflation
+            tests: >-
+              tests/agent/test_context_compressor_efficiency.py
+              tests/agent/test_context_compressor_cross_session_guard.py
+          - branch: feat/skill-linkedfiles-subdirs
+            pr: 31091
+            scope: tools — skill linked_files subdirectory auto-discovery
+            tests: >-
+              tests/tools/test_skill_linked_files.py
+              tests/tools/test_skill_manager_tool.py
+              tests/tools/test_skills_tool.py
+          - branch: codex/fix-setup-import-results
+            pr: 148203
+            scope: hermes_cli — setup agent-import next steps through wizard menus
+            tests: >-
+              tests/hermes_cli/test_setup_import_results.py
+              tests/hermes_cli/test_setup_agent_import.py
+    steps:
+      - name: Checkout the PR branch
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      # Resolve the exact identifiers this run tests before touching anything else,
+      # so the summary is correct even if a later lane fails.
+      - name: Resolve the tested commit and base
+        id: ids
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_ref="${{ inputs.base }}"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          # The upstream base is fetched by URL: the checkout only knows the fork's
+          # own origin, and this workflow must not depend on a configured remote.
+          git fetch --no-tags \
+            https://github.com/NousResearch/hermes-agent.git \
+            '+refs/heads/main:refs/remotes/upstream/main'
+          head_sha="$(git rev-parse HEAD)"
+          base_sha="$(git rev-parse "${base_ref}")"
+          merge_base="$(git merge-base "${base_sha}" "${head_sha}")"
+          {
+            echo "head=${head_sha}"
+            echo "base_sha=${base_sha}"
+            echo "merge_base=${merge_base}"
+            echo "commits=$(git rev-list --count "${merge_base}..${head_sha}")"
+          } >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.branch }} tested at ${head_sha} against ${base_ref} (${base_sha})"
+
+      # ── Lanes that need no toolchain, on the bare checkout ────────────────────────────────
+
+      # A commit carrying an unmapped author email fails the upstream attribution
+      # gate, so a rebased branch is not PR-ready until this passes. Same script
+      # repo-guards.yml runs; it only writes under $RUNNER_TEMP and $GITHUB_OUTPUT.
+      - name: Contributor attribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/check_contributor_emails.py
+
+      # Does the branch still merge into the base, or does it carry a conflict a
+      # reviewer would have to resolve? merge-tree is non-mutating: it reports the
+      # conflict without touching the worktree. Exits 1 on a conflict.
+      - name: Merge compatibility with the base
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          base="${{ steps.ids.outputs.base_sha }}"
+          if git merge-tree --write-tree "${base}" HEAD > "$RUNNER_TEMP/merge-tree.txt" 2>&1; then
+            echo "Merges cleanly into ${{ inputs.base }} (${base})."
+          else
+            echo "Does NOT merge cleanly into ${{ inputs.base }} (${base}):"
+            cat "$RUNNER_TEMP/merge-tree.txt"
+            exit 1
+          fi
+
+      # ── Toolchain: the repository's pinned PM setup ───────────────────────────────────────
+
+      - name: Set up the locked PM toolchain
+        id: setup
+        if: ${{ inputs.run_lint || inputs.run_tests }}
+        uses: ./.github/actions/setup-pm
+        with:
+          # The focused files drive the real scripts/build/node-deps.mjs, which needs
+          # pnpm (and with it PM's Node) on PATH.
+          packages: pnpm
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+          test-environment: ${{ inputs.run_tests && 'true' || 'false' }}
+          prune-python-cache: true
+
+      # ── Lint ──────────────────────────────────────────────────────────────────────────────
+
+      # Exports the ci-tools environment as `python` / `ruff` for later steps.
+      - name: Install the pinned lint tooling
+        if: ${{ inputs.run_lint }}
+        uses: ./.github/actions/retry
+        with:
+          command: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
+
+      # The same blocking invocation lint.yml runs: pyproject's selected rules, no
+      # --exit-zero, no `|| true`. The exit code fails the job.
+      - name: Lint (ruff check .)
+        if: ${{ inputs.run_lint }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          ruff check .
+
+      # ── Focused regression tests ──────────────────────────────────────────────────────────
+
+      - name: Focused regression tests
+        if: ${{ inputs.run_tests }}
+        shell: bash
+        timeout-minutes: 25
+        env:
+          # Same guard as tests.yml: a test must never reach a real provider.
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          scripts/run_tests.sh ${{ matrix.tests }}
+
+      # ── Summary ───────────────────────────────────────────────────────────────────────────
+
+      - name: Write the job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Fork validation — \`${{ matrix.branch }}\`"
+            echo
+            echo "- **PR:** #${{ matrix.pr }}"
+            echo "- **Scope:** ${{ matrix.scope }}"
+            echo "- **Tested commit:** \`${{ steps.ids.outputs.head }}\`"
+            echo "- **Base ref:** \`${{ inputs.base }}\`"
+            echo "- **Base commit:** \`${{ steps.ids.outputs.base_sha }}\`"
+            echo "- **Merge base:** \`${{ steps.ids.outputs.merge_base }}\`"
+            echo "- **Commits under test:** ${{ steps.ids.outputs.commits }}"
+            echo "- **Lanes:** contributor attribution, merge compatibility$( [ '${{ inputs.run_lint }}' = 'true' ] && echo ', lint' )$( [ '${{ inputs.run_tests }}' = 'true' ] && echo ', focused regression tests' )"
+            echo "- **Lint:** \`ruff check .\`$([ '${{ inputs.run_lint }}' != 'true' ] && echo ' (not requested)')"
+            echo
+            echo "Focused test files:"
+            echo
+            for file in ${{ matrix.tests }}; do
+              echo "- \`${file}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

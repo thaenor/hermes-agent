@@ -1,6 +1,6 @@
 # GitHub Actions workflows
 
-This directory has 57 workflow files. Most of them are **reusable workflows**
+This directory has 58 workflow files. Most of them are **reusable workflows**
 (`on: workflow_call`). They never start on their own; an entry-point workflow
 calls them. This README covers what starts each workflow, which jobs it skips
 and why, how to run it by hand, and how a regular CI run differs from a
@@ -566,6 +566,7 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
 | `e2e-desktop-core.yml` | E2E Desktop core | R | ci |
 | `e2e-desktop-update.yml` | E2E Desktop update | R | ci |
 | `e2e-desktop.yml` | E2E Desktop | R | ci (disabled) |
+| `fork-validation.yml` | Fork validation | dispatch | none |
 | `install-e2e-macos-run.yml` | install-e2e macos leg | R | install-e2e, stable |
 | `install-e2e-red.yml` | Install & Update E2E red tracker | workflow_run(Install & Update E2E), dispatch | none |
 | `install-e2e-run.yml` | Install & Update E2E (reusable) | R | install-e2e, macos leg |
